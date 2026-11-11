@@ -1,6 +1,8 @@
 """Các provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import random
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -14,16 +16,42 @@ CONFIG = {
 }
 
 
+# Retry transient provider failures: 429 = rate limited, 5xx = provider overloaded/broken.
+# 400/401/403/404 are NOT retried: the request or key is wrong, and retrying won't fix it.
+RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+MAX_RETRIES = int(os.getenv('PROVIDER_MAX_RETRIES', '5'))
+
+
+def _backoff_seconds(attempt, exc=None):
+    """Exponential backoff with jitter: ~1s, 2s, 4s, 8s, 16s (cap 30s).
+
+    If the server sends Retry-After, trust it. Jitter (the random part) stops many
+    parallel clients from retrying at the same instant and colliding again.
+    """
+    retry_after = exc.headers.get('Retry-After') if exc is not None and exc.headers else None
+    if retry_after and retry_after.isdigit():
+        return min(float(retry_after), 60.0)
+    return min(2 ** attempt, 30) + random.uniform(0, 1)
+
+
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+    body = json.dumps(payload).encode()
+    for attempt in range(MAX_RETRIES + 1):
+        req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in RETRYABLE_HTTP and attempt < MAX_RETRIES:
+                time.sleep(_backoff_seconds(attempt, exc))
+                continue
+            # Do not print response bodies: they may contain account or request data.
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            if attempt < MAX_RETRIES:
+                time.sleep(_backoff_seconds(attempt))
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
